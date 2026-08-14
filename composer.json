@@ -1,19 +1,32 @@
 {
     "name": "laikait/laika-mailman",
-    "type": "package",
-    "require": {
-        "phpmailer/phpmailer": "^7.1"
-    },
+    "description": "Mail package for the Laika PHP MVC Framework — send via PHPMailer (SMTP/sendmail/mail/qmail), read via built-in IMAP and POP3 clients.",
+    "type": "library",
     "license": "MIT",
-    "autoload": {
-        "psr-4": {
-            "Laikait\\Mailman\\": "src/"
-        }
-    },
+    "keywords": ["laika", "mail", "email", "smtp", "imap", "pop3", "phpmailer"],
     "authors": [
         {
-            "name": "Showket Ahmed",
+            "name": "Laika IT",
             "email": "strblackhawk@gmail.com"
+        },
+        {
+            "name": "Showket Ahmed",
+            "email": "riyadhtayf@gmail.com"
         }
-    ]
+    ],
+    "require": {
+        "php": "^8.1",
+        "ext-openssl": "*",
+        "ext-mbstring": "*",
+        "phpmailer/phpmailer": "^7.1"
+    },
+    "suggest": {
+        "league/oauth2-client": "Required only if you use PHPMailer's bundled OAuth class for XOAUTH2 — implementing OAuthTokenProvider yourself needs nothing"
+    },
+    "autoload": {
+        "psr-4": {
+            "Laika\\Mailman\\": "src/"
+        }
+    },
+    "minimum-stability": "stable"
 }
