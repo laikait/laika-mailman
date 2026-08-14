@@ -1,0 +1,306 @@
+name: PHP Compatibility
+
+on:
+  push:
+    branches:
+        - beta
+  pull_request:
+    branches:
+        - main
+  workflow_dispatch:
+
+# A new push to the same branch makes an in-flight run pointless.
+concurrency:
+  group: php-checker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Report every version, rather than hiding the rest behind the first
+      # failure — knowing a break is 8.5-only is the whole point of a matrix.
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+
+      - name: Set up PHP ${{ matrix.php }}
+        # Not pinned to a commit SHA like the other actions here: pin it with
+        #   gh api repos/shivammathur/setup-php/commits/v2 --jq .sha
+        # once you've verified the SHA yourself.
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 #v2
+        with:
+          php-version: ${{ matrix.php }}
+          # openssl and mbstring are declared in composer.json; ctype, filter
+          # and hash are phpmailer's own requirements and are easy to miss
+          # when provisioning a runner.
+          extensions: openssl, mbstring, ctype, filter, hash
+          coverage: none
+          ini-values: error_reporting=E_ALL, display_errors=On
+
+      - name: Validate composer.json
+        run: composer validate --strict --no-check-lock
+
+      - name: Install dependencies
+        # `update`, not `install`: composer.lock is gitignored (correct for a
+        # library), so there is no lock to install from, and resolving fresh
+        # per PHP version is exactly what a compatibility matrix should test.
+        run: composer update --prefer-dist --no-progress --no-interaction
+
+      - name: Lint every source file
+        run: |
+          status=0
+          while IFS= read -r file; do
+            if ! php -l "$file" > /dev/null 2>&1; then
+              echo "::error file=${file}::$(php -l "$file" 2>&1 | head -1)"
+              status=1
+            fi
+          done < <(find src examples -name '*.php')
+          if [ "$status" -eq 0 ]; then
+            echo "all source files parse on PHP $(php -r 'echo PHP_VERSION;')"
+          fi
+          exit $status
+
+      - name: Compatibility checks
+        run: |
+          cat > "${RUNNER_TEMP}/checker.php" <<'CHECKER'
+          <?php
+
+          /**
+           * Beyond `php -l`: a parse check only proves the syntax is legal on
+           * this version. It says nothing about a function that started
+           * emitting a deprecation, or a signature that stopped resolving. So
+           * this loads every class, reflects its signatures, and exercises the
+           * real API with E_DEPRECATED treated as a failure — that is what
+           * actually catches version drift.
+           *
+           * Written in 8.0-compatible syntax: a checker that cannot parse on
+           * the oldest supported version is useless.
+           */
+
+          error_reporting(E_ALL);
+
+          $root = getcwd();
+          $failures = array();
+          $checks = 0;
+
+          function ok($label) {
+              global $checks;
+              $checks++;
+              echo "  ok    " . $label . "\n";
+          }
+
+          function bad($label, $detail = '') {
+              global $checks, $failures;
+              $checks++;
+              $failures[] = $label . ($detail !== '' ? ': ' . $detail : '');
+              echo "::error::" . $label . ($detail !== '' ? ' — ' . $detail : '') . "\n";
+          }
+
+          echo "PHP " . PHP_VERSION . "\n\n";
+
+          // -------------------------------------------------- extensions
+
+          $manifest = json_decode(file_get_contents($root . '/composer.json'), true);
+
+          foreach (array_keys($manifest['require']) as $requirement) {
+              if (strpos($requirement, 'ext-') !== 0) {
+                  continue;
+              }
+              $ext = substr($requirement, 4);
+              extension_loaded($ext) ? ok('ext-' . $ext . ' loaded') : bad('ext-' . $ext . ' required but missing');
+          }
+
+          // ext-imap was deprecated in 8.4 and moved to PECL. Independence
+          // from it is why the IMAP client here is hand-written, so assert it
+          // rather than assuming it stayed true.
+          isset($manifest['require']['ext-imap'])
+              ? bad('composer.json requires ext-imap', 'PECL-only from PHP 8.4')
+              : ok('does not require ext-imap');
+
+          // -------------------------------------- autoload and signatures
+
+          require $root . '/vendor/autoload.php';
+
+          $classes = array();
+          $iterator = new RecursiveIteratorIterator(
+              new RecursiveDirectoryIterator($root . '/src', FilesystemIterator::SKIP_DOTS)
+          );
+
+          foreach ($iterator as $file) {
+              if (!$file->isFile() || strtolower($file->getExtension()) !== 'php') {
+                  continue;
+              }
+              $relative = substr($file->getPathname(), strlen($root . '/src/'));
+              $classes[] = 'Laika\\Mailman\\' . str_replace(array('/', '\\', '.php'), array('\\', '\\', ''), $relative);
+          }
+
+          $broken = 0;
+
+          foreach ($classes as $class) {
+              if (!class_exists($class) && !interface_exists($class)) {
+                  $broken++;
+                  bad('does not autoload', $class);
+                  continue;
+              }
+
+              // Reflecting forces PHP to resolve parameter and return types.
+              // A type that is legal to write but unresolvable on this version
+              // surfaces here instead of at a call site in production.
+              try {
+                  $reflection = new ReflectionClass($class);
+                  foreach ($reflection->getMethods() as $method) {
+                      $method->getParameters();
+                      $method->getReturnType();
+                  }
+                  $reflection->getConstants();
+              } catch (Throwable $e) {
+                  $broken++;
+                  bad('reflection failed', $class . ' — ' . $e->getMessage());
+              }
+          }
+
+          if ($broken === 0) {
+              ok(count($classes) . ' classes load and reflect');
+          }
+
+          // ------------------------------- behaviour, deprecations = failure
+
+          $deprecations = array();
+
+          set_error_handler(function ($severity, $message, $file = '', $line = 0) use (&$deprecations) {
+              if ($severity === E_DEPRECATED || $severity === E_USER_DEPRECATED) {
+                  $deprecations[] = $message . ' in ' . basename($file) . ':' . $line;
+                  return true;
+              }
+              return false;
+          });
+
+          $fixture = "From: Alice <alice@example.com>\r\n"
+              . "To: support+ticket-1234@example.com\r\n"
+              . "Subject: =?UTF-8?B?" . base64_encode('Cafe\xcc\x81 [TICKET-77]') . "?=\r\n"
+              . "Message-ID: <abc@example.com>\r\n"
+              . "In-Reply-To: <root@example.com>\r\n"
+              . "MIME-Version: 1.0\r\n"
+              . "Content-Type: multipart/mixed; boundary=\"BOUND\"\r\n"
+              . "\r\n"
+              . "--BOUND\r\n"
+              . "Content-Type: text/plain; charset=utf-8\r\n"
+              . "Content-Transfer-Encoding: quoted-printable\r\n"
+              . "\r\n"
+              . "Soft wrap =\r\nrejoined, euro =E2=82=AC sign.\r\n"
+              . "--BOUND\r\n"
+              // A non-UTF-8 part, so mb_convert_encoding is exercised too —
+              // the most version-sensitive call in the parser, and one that
+              // throws rather than warns on a bad encoding since PHP 8.0.
+              . "Content-Type: text/plain; charset=iso-8859-1\r\n"
+              . "\r\n"
+              . "caf\xE9 na\xEFve\r\n"
+              . "--BOUND\r\n"
+              . "Content-Type: application/pdf\r\n"
+              . "Content-Disposition: attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.pdf\r\n"
+              . "Content-Transfer-Encoding: base64\r\n"
+              . "\r\n"
+              . chunk_split(base64_encode('%PDF-1.4 bytes'), 76, "\r\n")
+              . "--BOUND--\r\n";
+
+          $tests = array(
+              'MimeParser decodes a multipart message' => function () use ($fixture) {
+                  $m = Laika\Mailman\Mime\MimeParser::parseMessage($fixture);
+
+                  return strpos($m->textBody, "\xE2\x82\xAC") !== false
+                      && strpos($m->textBody, "caf\xC3\xA9") !== false
+                      && count($m->attachments) === 1
+                      && $m->attachments[0]->filename === "r\xC3\xA9sum\xC3\xA9.pdf"
+                      && $m->attachments[0]->content === '%PDF-1.4 bytes';
+              },
+
+              'Attachment::safeFilename strips traversal' => function () {
+                  $a = new Laika\Mailman\Attachment('../../etc/passwd', 'text/plain', 3, 'abc');
+
+                  return $a->safeFilename() === 'passwd';
+              },
+
+              'Pipeline extracts and ranks identifiers' => function () use ($fixture) {
+                  $r = call_user_func(array(new Laika\Mailman\Pipeline\Pipeline(), 'scan'),
+                      Laika\Mailman\Mime\MimeParser::parseMessage($fixture));
+
+                  // The plus-addressed recipient must outrank the subject tag.
+                  return $r->first('ticket') === '1234'
+                      && $r->confidenceOf('ticket') === Laika\Mailman\Pipeline\ScanResult::RECIPIENT
+                      && $r->isReply() === true;
+              },
+
+              'Pipeline dispatches over a RawSource' => function () use ($fixture) {
+                  $hits = 0;
+                  $pipeline = new Laika\Mailman\Pipeline\Pipeline();
+                  $stats = $pipeline
+                      ->onIdentifier('ticket', function () use (&$hits) { $hits++; })
+                      ->afterProcessing(Laika\Mailman\Pipeline\Pipeline::LEAVE)
+                      ->run(new Laika\Mailman\Pipeline\Source\RawSource(array($fixture)));
+
+                  return $hits === 1 && $stats['handled'] === 1 && $stats['failed'] === 0;
+              },
+
+              'Mailer builds a message and normalises X-Mailer' => function () {
+                  $mailer = new Laika\Mailman\Mailer(array('driver' => 'mail', 'from' => 'a@example.com'));
+                  $mailer->to('b@example.com')->subject("\xC3\x9Cnicode")->body('<p>hi</p>', 'hi')
+                         ->attachData('id,name', 'r.csv', 'text/csv');
+
+                  $default = $mailer->phpMailer()->XMailer;
+                  $mailer->xmailer(Laika\Mailman\Mailer::XMAILER_NONE);
+
+                  return $default === 'Laika Mailman' && $mailer->phpMailer()->XMailer === null;
+              },
+
+              'Readers parse DSNs without connecting' => function () {
+                  $imap = Laika\Mailman\Reader\ImapReader::fromDsn('imaps://u:pa%40ss@imap.example.com:993/INBOX');
+                  $pop3 = Laika\Mailman\Reader\Pop3Reader::fromDsn('pop3s://u:p@pop.example.com:995');
+                  $socket = new Laika\Mailman\Transport\Socket('example.com', 993, 'ssl', 5);
+
+                  return $imap instanceof Laika\Mailman\Reader\ImapReader
+                      && $pop3 instanceof Laika\Mailman\Reader\Pop3Reader
+                      && $socket->isConnected() === false;
+              },
+          );
+
+          foreach ($tests as $label => $test) {
+              try {
+                  $result = $test();
+                  $result === true ? ok($label) : bad($label, 'returned ' . var_export($result, true));
+              } catch (Throwable $e) {
+                  bad($label, get_class($e) . ': ' . $e->getMessage());
+              }
+          }
+
+          restore_error_handler();
+
+          if (count($deprecations) === 0) {
+              ok('no deprecation notices raised');
+          } else {
+              foreach (array_unique($deprecations) as $deprecation) {
+                  bad('deprecated on PHP ' . PHP_VERSION, $deprecation);
+              }
+          }
+
+          // ------------------------------------------------------ summary
+
+          echo "\n" . PHP_VERSION . ": " . $checks . " checks, " . count($failures) . " failed\n";
+
+          exit(count($failures) === 0 ? 0 : 1);
+          CHECKER
+
+          php "${RUNNER_TEMP}/checker.php"
+
+      - name: Summary
+        if: always()
+        run: echo "### PHP ${{ matrix.php }} — ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
