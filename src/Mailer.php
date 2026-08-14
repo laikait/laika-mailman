@@ -23,13 +23,24 @@ use PHPMailer\PHPMailer\Exception as PHPMailerException;
  */
 class Mailer implements MailerInterface
 {
+    /** Emit no X-Mailer header at all. */
+    public const XMAILER_NONE = null;
+
+    /**
+     * PHPMailer's own default — "PHPMailer <version> (<url>)".
+     *
+     * Opt in only if you actually want the library and its exact patch level
+     * disclosed to every recipient.
+     */
+    public const XMAILER_PHPMAILER = '';
+
     protected PHPMailer $mail;
     protected array $config;
 
     /**
      * Config keys: driver ('smtp'|'mail'|'sendmail'|'qmail'), host, port,
      * username, password, encryption ('tls'|'ssl'|''), from, from_name,
-     * charset, timeout, debug, keepalive, auto_tls, validate_cert.
+     * charset, xmailer, timeout, debug, keepalive, auto_tls, validate_cert.
      */
     public function __construct(array $config = [])
     {
@@ -43,6 +54,11 @@ class Mailer implements MailerInterface
             'from' => '',
             'from_name' => '',
             'charset' => PHPMailer::CHARSET_UTF8,
+            // Identifies the sending software without a version number.
+            // Left unset, PHPMailer would advertise "PHPMailer 7.1.1 (...)"
+            // on every message, which tells recipients exactly which release
+            // to look up in a vulnerability list and benefits nobody.
+            'xmailer' => 'Laika Mailman',
             'timeout' => 30,
             'debug' => 0,
             'keepalive' => false,
@@ -211,6 +227,25 @@ class Mailer implements MailerInterface
         return $this;
     }
 
+    /**
+     * Set, replace or remove the X-Mailer header.
+     *
+     *   $mailer->xmailer('My App 2.0');                  // X-Mailer: My App 2.0
+     *   $mailer->xmailer(Mailer::XMAILER_NONE);          // no header at all
+     *   $mailer->xmailer(Mailer::XMAILER_PHPMAILER);     // PHPMailer's default
+     *
+     * Use the constants rather than a bare null or '': PHPMailer's own
+     * three-way meaning for this property is genuinely counter-intuitive —
+     * see normalizeXMailer().
+     */
+    public function xmailer(?string $value): static
+    {
+        $this->config['xmailer'] = $value;
+        $this->mail->XMailer = $this->normalizeXMailer($value);
+
+        return $this;
+    }
+
     /** XOAUTH2. See the README on implementing OAuthTokenProvider yourself. */
     public function oauth(OAuthTokenProvider $provider): static
     {
@@ -315,6 +350,10 @@ class Mailer implements MailerInterface
         $this->mail->CharSet = (string) $this->config['charset'];
         $this->mail->Encoding = PHPMailer::ENCODING_BASE64;
 
+        // Outside the SMTP branch below on purpose: X-Mailer is a message
+        // header, so it applies to mail()/sendmail/qmail sends too.
+        $this->mail->XMailer = $this->normalizeXMailer($this->config['xmailer']);
+
         if ($this->config['driver'] === 'smtp') {
             $this->mail->Host = (string) $this->config['host'];
             $this->mail->Port = (int) $this->config['port'];
@@ -355,6 +394,43 @@ class Mailer implements MailerInterface
                 (string) $this->config['from_name']
             ));
         }
+    }
+
+    /**
+     * Maps our value onto PHPMailer's three-way $XMailer contract.
+     *
+     * That contract is a trap worth wrapping rather than passing along
+     * (PHPMailer.php:2918-2927):
+     *
+     *   ''                     -> emits "PHPMailer <version> (<url>)"
+     *   non-empty string       -> emits that string
+     *   null / whitespace-only -> emits no header at all
+     *
+     * So the empty string means "use the default", not "none" — the opposite
+     * of the obvious reading. Anyone setting XMailer = '' to suppress the
+     * header gets the loudest possible value instead. The XMAILER_NONE and
+     * XMAILER_PHPMAILER constants exist so call sites state which they mean.
+     *
+     * A value that trims to empty is normalised to an explicit null rather
+     * than left to fall through PHPMailer's implicit final branch, so the
+     * "no header" intent is stated rather than inferred.
+     */
+    protected function normalizeXMailer(mixed $value): ?string
+    {
+        if ($value === null) {
+            return self::XMAILER_NONE;
+        }
+
+        if ($value === self::XMAILER_PHPMAILER) {
+            return self::XMAILER_PHPMAILER;
+        }
+
+        // PHPMailer runs this through secureHeader() on the way out, but
+        // stripping at the boundary means a header-injection attempt never
+        // reaches the property in the first place.
+        $value = trim(str_replace(["\r", "\n", "\0"], '', (string) $value));
+
+        return $value === '' ? self::XMAILER_NONE : $value;
     }
 
     /**
