@@ -1,0 +1,19 @@
+{
+    "name": "laikait/laika-mailman",
+    "type": "package",
+    "require": {
+        "phpmailer/phpmailer": "^7.1"
+    },
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Laikait\\Mailman\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Showket Ahmed",
+            "email": "strblackhawk@gmail.com"
+        }
+    ]
+}
